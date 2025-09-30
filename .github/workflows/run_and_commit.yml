@@ -1,17 +1,27 @@
 name: Run Python Script and Commit SVG
 
 on:
+  pull_request:
   push:
     branches:
       - main
 
 jobs:
   run-and-commit:
+    name: Update plot
     runs-on: ubuntu-latest
+    # Skip if the last commit was made by GitHub Action
+    if: ${{ github.event.head_commit.author.name != 'GitHub Action' }}
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        token: ${{ github.event_name == 'push' && secrets.FG_ICECLASSIC || github.token }}
+        ref: ${{ github.event.pull_request.head.sha }} #https://stackoverflow.com/questions/62334460/git-history-in-a-github-action
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -23,19 +33,84 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Validate predictions.txt changes (PR only)
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        echo "Checking if predictions.txt changes are valid (only additions allowed)..."
+        
+        # Check if predictions.txt was modified
+        if git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} | grep -q "data/predictions.txt"; then
+          echo "predictions.txt was modified, validating changes..."
+          
+          # Check for deletions (lines starting with -)
+          DELETIONS=$(git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} data/predictions.txt | grep "^-" | grep -v "^---" || true)
+          
+          if [ ! -z "$DELETIONS" ]; then
+            echo "❌ ERROR: Deletions found in predictions.txt!"
+            echo "Students are only allowed to ADD predictions, not delete existing ones."
+            echo ""
+            echo "Deleted lines:"
+            echo "$DELETIONS"
+            exit 1
+          else
+            echo "✅ Only additions found in predictions.txt - this is allowed."
+          fi
+        else
+          echo "predictions.txt was not modified in this PR."
+        fi
+
+    - name: Validate predictions.txt CSV format (PR only)
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        echo "Checking CSV format of predictions.txt..."
+        
+        # Check if predictions.txt exists
+        if [ ! -f "data/predictions.txt" ]; then
+          echo "❌ ERROR: data/predictions.txt file not found!"
+          exit 1
+        fi
+        
+        # Validate CSV format - each line should have exactly 2 columns separated by semicolon
+        INVALID_LINES=$(awk -F';' 'NF != 2 { print NR ": " $0 }' data/predictions.txt || true)
+        
+        if [ ! -z "$INVALID_LINES" ]; then
+          echo "❌ ERROR: Invalid CSV format in predictions.txt!"
+          echo "Each line must have exactly 2 columns separated by semicolon (;)"
+          echo ""
+          echo "Invalid lines found:"
+          echo "$INVALID_LINES"
+          echo ""
+          echo "Expected format: Name;YYYY-MM-DD HH:MM:SS"
+          exit 1
+        else
+          echo "✅ CSV format validation passed - all lines have exactly 2 columns."
+        fi
+
     - name: Run Python script
-      run: python create_figure.py
+      run: python -W error create_figure.py
 
     - name: Touch README
       run: touch README.md
 
     - name: Commit and push changes
+      if: ${{ github.event_name == 'push' }}
       run: |
-        git config --local user.email "test@github.com"
-        git config --local user.name "GitHub Action test"
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
         git add predictions.svg predictions_all.svg README.md
-        git commit -m 'Update predictions*.svg'
-    - name: Push changes
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
+        git diff --staged --quiet || (git commit -m 'Update predictions*.svg' && git push)
+
+    - name: Check for changes (PR validation only)
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        git add predictions.svg predictions_all.svg README.md
+        if ! git diff --staged --quiet; then
+          echo "✅ The Python script successfully generated changes to the SVG files."
+          echo "This PR will update the plot files when merged."
+          git diff --staged --name-only
+          exit 0
+        else
+          echo "❌ No changes detected to SVG files."
+          echo "Either the Python script failed or no updates are needed."
+          exit 1
+        fi
